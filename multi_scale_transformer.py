@@ -495,10 +495,6 @@ class MultiScaleTransformer(nn.Module):
         y_sec = self.sec_head(decoded)  # (B, H, 1)
         y_nat = self.nat_head(decoded)  # (B, H, 1)
 
-        y_fac = self.fac_head(decoded)
-        y_sec = self.sec_head(decoded)
-        y_nat = self.nat_head(decoded)
-
         # Optional safety clamp in scaled space
         y_fac = torch.clamp(y_fac, -1e3, 1e3)
         y_sec = torch.clamp(y_sec, -1e3, 1e3)

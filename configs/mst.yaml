@@ -1,6 +1,6 @@
 data:
-  context_length: 8
-  forecast_horizon: 3
+  context_length: 60      # 2 years of history
+  forecast_horizon: 14     # 6 months ahead
   batch_size: 64
   num_workers: 2
 
@@ -12,7 +12,7 @@ model:
   dim_feedforward: 1024
   dropout: 0.1
   downsample_factor: 3
-  forecast_horizon: 3
+  forecast_horizon: 14     # MUST match data.forecast_horizon
   learning_rate: 0.0001
   weight_decay: 0.01
   step_lr_gamma: 0.98

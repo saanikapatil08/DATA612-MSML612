@@ -68,17 +68,19 @@ def main():
 
     # 4. Callbacks
     checkpoint_cb = ModelCheckpoint(
-        monitor="val_loss",
-        filename="mst-{epoch:02d}-{val_loss:.4f}",
-        save_top_k=3,
+        dirpath=None,                # let PL put it under logger.log_dir / "checkpoints"
+        filename="mst-{epoch:02d}-{train_loss:.4e}",
+        save_top_k=1,
+        save_last=True,
+        monitor="train_loss",        # IMPORTANT: we know val_loss doesn't exist right now
         mode="min",
-    )
+        )
 
     early_stop_cb = EarlyStopping(
-        monitor="val_loss",
-        patience=10,
+        monitor="train_loss",   # was "val_loss"
         mode="min",
-        verbose=True,
+        patience=5,
+        check_on_train_epoch_end=True,  # optional but nice
     )
 
     logger = TensorBoardLogger("logs", name="mst")

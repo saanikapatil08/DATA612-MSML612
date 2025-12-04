@@ -2,29 +2,33 @@
 # -*- coding: utf-8 -*-
 """
 Data processing for MST — build hierarchical time-series dicts
-from the finalized EPA pipeline outputs.
+from the finalized CAMPD monthly pipeline outputs.
 
 Assumes these files already exist (from your builder pipeline):
 
-1) out_epa/training_facility_year.csv
-   - primary_key: [fac_id, year]
+1) out_epa/training_plant_period.csv
+   - primary_key: [plant_id, date]
    - columns include:
-       fac_id, year, co2e_total, ...
-       (optionally sector_name, sector_co2e, sector lags, etc.)
+       plant_id, date (month-start), co2e_total, ...
+       (plus engineered features, sector_name, etc.)
 
-2) out_epa/sector_year_totals.csv
-   - primary_key: [year, sector_name]
-   - columns: year, sector_name, sector_co2e
+2) out_epa/sector_period_totals.csv
+   - primary_key: [sector_name, date]
+   - columns: date, sector_name, sector_co2
 
-3) out_epa/splits_years.json
-   - {"train": [...], "val": [...], "test": [...]}
+3) out_epa/splits_dates.json
+   - {
+       "train": ["2015-01-01","2022-12-31"],
+       "val":   ["2023-01-01","2023-12-31"],
+       "test":  ["2024-01-01","2024-12-31"]
+     }
 
 Outputs written to out_epa/output/:
 
-- facility_series.pkl   # {fac_id: pd.Series(year -> co2e_total)}
-- sector_series.pkl     # {sector_name: pd.Series(year -> sector_co2e)}
-- national_series.pkl   # {"national": pd.Series(year -> national_co2e)}
-- splits_years.json     # copy of splits for convenience
+- plant_series.pkl    # {plant_id: pd.Series(date -> co2e_total)}
+- sector_series.pkl   # {sector_name: pd.Series(date -> sector_co2)}
+- national_series.pkl # {"national": pd.Series(date -> national_co2)}
+- splits_dates.json   # copy of splits for convenience
 
 These are what your MST dataloader will consume.
 """
@@ -33,9 +37,8 @@ import json
 import logging
 import pickle
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
-import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------
@@ -47,100 +50,118 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-OUT_DIR = Path("out_epa")
-OUTPUT_DIR = OUT_DIR / "output"
+BASE_DIR = Path("out_epa")
+OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-TRAINING_FACILITY_PATH = OUT_DIR / "training_facility_year.csv"
-SECTOR_TOTALS_PATH     = OUT_DIR / "sector_year_totals.csv"
-SPLITS_PATH            = OUT_DIR / "splits_years.json"
+TRAINING_PLANT_PATH = BASE_DIR / "training_plant_period.csv"
+SECTOR_TOTALS_PATH = BASE_DIR / "sector_period_totals.csv"
+SPLITS_PATH        = BASE_DIR / "splits_dates.json"
 
 
 # ---------------------------------------------------------------------
 # Loaders
 # ---------------------------------------------------------------------
-def load_training_facility(path: Path = TRAINING_FACILITY_PATH) -> pd.DataFrame:
-    """Load training_facility_year.csv and standardize types."""
+def load_training_plant(path: Path = TRAINING_PLANT_PATH) -> pd.DataFrame:
+    """Load training_plant_period.csv and standardize types."""
     if not path.exists():
         raise FileNotFoundError(
-            f"{path} not found. Make sure your EPA builder pipeline "
-            f"has produced training_facility_year.csv."
+            f"{path} not found. Make sure your EPA pipeline "
+            f"has produced training_plant_period.csv."
         )
 
-    df = pd.read_csv(path)
-    logger.info("Loaded training_facility_year.csv with %d rows, %d columns.",
+    df = pd.read_csv(path, parse_dates=["date"])
+    logger.info("Loaded training_plant_period.csv with %d rows, %d columns.",
                 len(df), df.shape[1])
 
-    if "year" not in df.columns or "fac_id" not in df.columns:
-        raise KeyError("training_facility_year.csv must have 'fac_id' and 'year' columns.")
+    required_id_cols = {"plant_id", "date"}
+    missing_ids = required_id_cols - set(df.columns)
+    if missing_ids:
+        raise KeyError(f"training_plant_period.csv missing columns: {missing_ids}")
 
-    if "co2e_total" not in df.columns:
-        raise KeyError("training_facility_year.csv must contain 'co2e_total' column "
-                       "for facility-level emissions.")
+    # Target column: prefer co2e_total, fall back to co2_total if needed
+    cols_low = {c.lower(): c for c in df.columns}
+    co2e_col = cols_low.get("co2e_total") or cols_low.get("co2_total")
+    if co2e_col is None:
+        raise KeyError(
+            "training_plant_period.csv must contain 'co2e_total' or 'co2_total' column "
+            "for plant-level emissions."
+        )
 
-    # Normalize types
-    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
-    df = df.dropna(subset=["year", "fac_id", "co2e_total"])
-    df["year"] = df["year"].astype(int)
+    if co2e_col != "co2e_total":
+        df = df.rename(columns={co2e_col: "co2e_total"})
+
+    # Normalize date to month-start and types
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["plant_id", "date", "co2e_total"])
+    df["date"] = df["date"].dt.normalize()
+
     df["co2e_total"] = pd.to_numeric(df["co2e_total"], errors="coerce")
+    df = df.dropna(subset=["co2e_total"])
 
     return df
 
 
 def load_sector_totals(path: Path = SECTOR_TOTALS_PATH) -> pd.DataFrame:
-    """Load sector_year_totals.csv and aggregate by (year, sector_name) if needed."""
+    """Load sector_period_totals.csv and aggregate by (date, sector_name) if needed."""
     if not path.exists():
         raise FileNotFoundError(
-            f"{path} not found. Your EPA builder should have written sector_year_totals.csv."
+            f"{path} not found. Your EPA pipeline should have written sector_period_totals.csv."
         )
 
-    df = pd.read_csv(path)
-    logger.info("Loaded sector_year_totals.csv with %d rows, %d columns.",
+    df = pd.read_csv(path, parse_dates=["date"])
+    logger.info("Loaded sector_period_totals.csv with %d rows, %d columns.",
                 len(df), df.shape[1])
 
     cols_low = {c.lower(): c for c in df.columns}
-    # Map flexible column names to canonical ones
-    year_col   = cols_low.get("year")
-    sector_col = cols_low.get("sector_name") or cols_low.get("sector")
-    co2e_col   = cols_low.get("sector_co2e") or cols_low.get("co2e") or cols_low.get("emissions")
+    date_col    = cols_low.get("date")
+    sector_col  = cols_low.get("sector_name") or cols_low.get("sector")
+    sector_co2_col = (
+        cols_low.get("sector_co2")
+        or cols_low.get("sector_co2e")
+        or cols_low.get("co2e")
+        or cols_low.get("emissions")
+    )
 
-    if year_col is None or sector_col is None or co2e_col is None:
+    if date_col is None or sector_col is None or sector_co2_col is None:
         raise KeyError(
-            "sector_year_totals.csv must have columns for year, sector_name, and sector_co2e "
+            "sector_period_totals.csv must have columns for date, sector_name, and sector_co2 "
             f"(found columns: {df.columns.tolist()})"
         )
 
     df = df.rename(columns={
-        year_col: "year",
+        date_col: "date",
         sector_col: "sector_name",
-        co2e_col: "sector_co2e",
+        sector_co2_col: "sector_co2",
     })
 
-    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
-    df["sector_co2e"] = pd.to_numeric(df["sector_co2e"], errors="coerce")
-    df = df.dropna(subset=["year", "sector_name", "sector_co2e"])
-    df["year"] = df["year"].astype(int)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["sector_co2"] = pd.to_numeric(df["sector_co2"], errors="coerce")
+    df = df.dropna(subset=["date", "sector_name", "sector_co2"])
+    df["date"] = df["date"].dt.normalize()
 
-    # Aggregate in case there are multiple rows per (year, sector_name)
-    df_tidy = (df
-               .groupby(["year", "sector_name"], as_index=False)["sector_co2e"]
-               .sum()
-               .sort_values(["sector_name", "year"]))
+    # Aggregate in case there are multiple rows per (date, sector_name)
+    df_tidy = (
+        df.groupby(["date", "sector_name"], as_index=False)["sector_co2"]
+          .sum()
+          .sort_values(["sector_name", "date"])
+    )
 
-    logger.info("Tidied sector totals to %d rows (unique year×sector).", len(df_tidy))
+    logger.info("Tidied sector totals to %d rows (unique date×sector).", len(df_tidy))
     return df_tidy
 
 
-def load_splits(path: Path = SPLITS_PATH) -> Dict[str, list]:
+def load_splits_raw(path: Path = SPLITS_PATH) -> Dict[str, list]:
+    """
+    Load splits_dates.json as raw dict; we just copy it into output for the dataloader.
+    """
     if not path.exists():
-        logger.warning("splits_years.json not found at %s — proceeding without splits.", path)
+        logger.warning("splits_dates.json not found at %s — proceeding without splits.", path)
         return {}
     with open(path, "r") as f:
         splits = json.load(f)
-    # normalize to int lists
-    out = {k: [int(y) for y in v] for k, v in splits.items()}
-    logger.info("Loaded splits_years.json: %s", out)
-    return out
+    logger.info("Loaded splits_dates.json: %s", splits)
+    return splits
 
 
 def save_pickle(obj, path: Path) -> None:
@@ -152,59 +173,65 @@ def save_pickle(obj, path: Path) -> None:
 # ---------------------------------------------------------------------
 # Series builders
 # ---------------------------------------------------------------------
-def build_facility_series(
-    training_facility: pd.DataFrame,
-    min_points: int = 4,
+def build_plant_series(
+    training_plant: pd.DataFrame,
+    min_points: int = 1,
 ) -> Dict[str, pd.Series]:
     """
-    Build {fac_id: Series(year -> co2e_total)} from training_facility_year.
+    Build {plant_id: Series(date -> co2e_total)} from training_plant_period.
 
-    Uses only 'fac_id', 'year', and 'co2e_total'.
+    Uses only 'plant_id', 'date', and 'co2e_total'.
     """
-    required = {"fac_id", "year", "co2e_total"}
-    missing = required - set(training_facility.columns)
+    required = {"plant_id", "date", "co2e_total"}
+    missing = required - set(training_plant.columns)
     if missing:
-        raise KeyError(f"training_facility_year.csv missing columns: {missing}")
+        raise KeyError(f"training_plant_period.csv missing columns: {missing}")
 
-    df = (training_facility
-          .copy()
-          .loc[:, ["fac_id", "year", "co2e_total"]]
-          .dropna(subset=["year", "co2e_total"]))
+    df = (
+        training_plant
+        .copy()
+        .loc[:, ["plant_id", "date", "co2e_total"]]
+        .dropna(subset=["date", "co2e_total"])
+    )
 
-    facility_series: Dict[str, pd.Series] = {}
+    plant_series: Dict[str, pd.Series] = {}
 
-    for fac_id, g in df.groupby("fac_id"):
-        s = (g[["year", "co2e_total"]]
-             .drop_duplicates(subset=["year"])
-             .set_index("year")["co2e_total"]
-             .sort_index())
+    for plant_id, g in df.groupby("plant_id"):
+        s = (
+            g[["date", "co2e_total"]]
+            .drop_duplicates(subset=["date"])
+            .set_index("date")["co2e_total"]
+            .sort_index()
+        )
         if len(s) >= min_points:
-            facility_series[str(fac_id)] = s
+            plant_series[str(plant_id)] = s
 
-    logger.info("Built facility series for %d facilities (min_points=%d).",
-                len(facility_series), min_points)
-    return facility_series
+    logger.info("Built plant series for %d plants (min_points=%d).",
+                len(plant_series), min_points)
+    return plant_series
 
 
 def build_sector_series(
     sector_tidy: pd.DataFrame,
-    min_points: int = 3,
+    min_points: int = 6,
 ) -> Dict[str, pd.Series]:
     """
-    Build {sector_name: Series(year -> sector_co2e)}.
+    Build {sector_name: Series(date -> sector_co2)}.
     """
-    required = {"year", "sector_name", "sector_co2e"}
+    required = {"date", "sector_name", "sector_co2"}
     missing = required - set(sector_tidy.columns)
     if missing:
-        raise KeyError(f"sector_year_totals missing columns: {missing}")
+        raise KeyError(f"sector_period_totals missing columns: {missing}")
 
     sector_series: Dict[str, pd.Series] = {}
 
     for sector, g in sector_tidy.groupby("sector_name"):
-        s = (g[["year", "sector_co2e"]]
-             .drop_duplicates(subset=["year"])
-             .set_index("year")["sector_co2e"]
-             .sort_index())
+        s = (
+            g[["date", "sector_co2"]]
+            .drop_duplicates(subset=["date"])
+            .set_index("date")["sector_co2"]
+            .sort_index()
+        )
         if len(s) >= min_points:
             sector_series[str(sector)] = s
 
@@ -215,14 +242,16 @@ def build_sector_series(
 
 def build_national_series(sector_tidy: pd.DataFrame) -> Dict[str, pd.Series]:
     """
-    Build {"national": Series(year -> national_co2e)},
-    where national_co2e is sum over sectors for each year.
+    Build {"national": Series(date -> national_co2)},
+    where national_co2 is sum over sectors for each date.
     """
-    nat = (sector_tidy
-           .groupby("year", as_index=True)["sector_co2e"]
-           .sum()
-           .sort_index())
-    logger.info("Built national series with %d years.", len(nat))
+    nat = (
+        sector_tidy
+        .groupby("date", as_index=True)["sector_co2"]
+        .sum()
+        .sort_index()
+    )
+    logger.info("Built national series with %d months.", len(nat))
     return {"national": nat}
 
 
@@ -230,28 +259,28 @@ def build_national_series(sector_tidy: pd.DataFrame) -> Dict[str, pd.Series]:
 # Main
 # ---------------------------------------------------------------------
 def main():
-    logger.info("=== MST data processing (new structure) ===")
+    logger.info("=== MST data processing (plant-month structure) ===")
 
     # 1) Load tables
-    training_facility = load_training_facility(TRAINING_FACILITY_PATH)
-    sector_tidy       = load_sector_totals(SECTOR_TOTALS_PATH)
-    splits            = load_splits(SPLITS_PATH)
+    training_plant = load_training_plant(TRAINING_PLANT_PATH)
+    sector_tidy    = load_sector_totals(SECTOR_TOTALS_PATH)
+    splits_raw     = load_splits_raw(SPLITS_PATH)
 
     # 2) Build hierarchical time series
-    facility_series = build_facility_series(training_facility, min_points=4)
-    sector_series   = build_sector_series(sector_tidy, min_points=3)
+    plant_series   = build_plant_series(training_plant, min_points=1)
+    sector_series  = build_sector_series(sector_tidy, min_points=6)
     national_series = build_national_series(sector_tidy)
 
     # 3) Save pickles for the MST dataloader
-    save_pickle(facility_series, OUTPUT_DIR / "facility_series.pkl")
-    save_pickle(sector_series,   OUTPUT_DIR / "sector_series.pkl")
+    save_pickle(plant_series,   OUTPUT_DIR / "plant_series.pkl")
+    save_pickle(sector_series,  OUTPUT_DIR / "sector_series.pkl")
     save_pickle(national_series, OUTPUT_DIR / "national_series.pkl")
 
-    # 4) Copy splits_years.json for convenience
-    if splits:
-        with open(OUTPUT_DIR / "splits_years.json", "w") as f:
-            json.dump(splits, f, indent=2)
-        logger.info("Copied splits_years.json → %s", OUTPUT_DIR / "splits_years.json")
+    # 4) Copy splits_dates.json for convenience
+    if splits_raw:
+        with open(OUTPUT_DIR / "splits_dates.json", "w") as f:
+            json.dump(splits_raw, f, indent=2)
+        logger.info("Copied splits_dates.json → %s", OUTPUT_DIR / "splits_dates.json")
 
     logger.info("Done. Hierarchical series written under %s", OUTPUT_DIR.resolve())
 

@@ -3,20 +3,20 @@
 """
 Data loaders for Multi-Scale Transformer (MST) hierarchical time-series.
 
-Consumes the outputs from data_processing.py:
+Consumes the outputs from data_preprocessing.py:
 
-- out_epa/output/facility_series.pkl   # {fac_id: pd.Series(year -> co2e_total)}
-- out_epa/output/sector_series.pkl     # {sector_name: pd.Series(year -> sector_co2e)}
-- out_epa/output/national_series.pkl   # {"national": pd.Series(year -> national_co2e)}
-- out_epa/output/splits_years.json     # {"train": [...], "val": [...], "test": [...]}
+- out_epa/output/plant_series.pkl     # {plant_id: pd.Series(date -> co2e_total)}
+- out_epa/output/sector_series.pkl    # {sector_name: pd.Series(date -> sector_co2)}
+- out_epa/output/national_series.pkl  # {"national": pd.Series(date -> national_co2)}
+- out_epa/output/splits_dates.json    # {"train": ["2015-01-01","2022-12-31"], ...}
 
-We build sliding facility windows:
+We build sliding plant windows:
 
 Inputs:
-    x:      (T, 1)  facility context window
+    x:      (T, 1)  plant context window (scaled)
 
-Targets:
-    y_fac:  (H, 1)  facility emissions
+Targets (still linear/original magnitudes):
+    y_fac:  (H, 1)  plant emissions
     y_sec:  (H, 1)  sector-level target (currently fallback = national)
     y_nat:  (H, 1)  national emissions
 
@@ -32,7 +32,7 @@ Batch item:
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -45,13 +45,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-ROOT_DIR = Path("out_epa")
+ROOT_DIR   = Path("out_epa")
 OUTPUT_DIR = ROOT_DIR / "output"
 
-FACILITY_SERIES_PATH = OUTPUT_DIR / "facility_series.pkl"
-SECTOR_SERIES_PATH   = OUTPUT_DIR / "sector_series.pkl"
+PLANT_SERIES_PATH   = OUTPUT_DIR / "plant_series.pkl"
+SECTOR_SERIES_PATH  = OUTPUT_DIR / "sector_series.pkl"
 NATIONAL_SERIES_PATH = OUTPUT_DIR / "national_series.pkl"
-SPLITS_PATH          = OUTPUT_DIR / "splits_years.json"
+SPLITS_PATH         = OUTPUT_DIR / "splits_dates.json"
 
 
 # ------------------ loading utilities ------------------ #
@@ -59,7 +59,7 @@ SPLITS_PATH          = OUTPUT_DIR / "splits_years.json"
 def _load_pickle(path: Path):
     import pickle
     if not path.exists():
-        raise FileNotFoundError(f"Missing file: {path}. Run data_processing.py first.")
+        raise FileNotFoundError(f"Missing file: {path}. Run data_preprocessing.py first.")
     with open(path, "rb") as f:
         obj = pickle.load(f)
     logger.info("Loaded %s", path)
@@ -67,42 +67,59 @@ def _load_pickle(path: Path):
 
 
 def load_series_dicts(root_dir: Path = OUTPUT_DIR):
-    facility_series = _load_pickle(root_dir / "facility_series.pkl")
-    sector_series   = _load_pickle(root_dir / "sector_series.pkl")
-    national_dict   = _load_pickle(root_dir / "national_series.pkl")
+    plant_series   = _load_pickle(root_dir / "plant_series.pkl")
+    sector_series  = _load_pickle(root_dir / "sector_series.pkl")   # not used yet
+    national_dict  = _load_pickle(root_dir / "national_series.pkl")
 
     if "national" not in national_dict:
         raise KeyError("national_series.pkl must contain key 'national'.")
 
     nat_series = national_dict["national"]
-    return facility_series, sector_series, nat_series
+    return plant_series, sector_series, nat_series
 
 
-def load_splits(path: Path = SPLITS_PATH) -> Dict[str, List[int]]:
+def load_splits(path: Path = SPLITS_PATH) -> Dict[str, Tuple[pd.Timestamp, pd.Timestamp]]:
+    """
+    Load splits_dates.json and return:
+        {
+          "train": (start_ts, end_ts),
+          "val":   (start_ts, end_ts),
+          "test":  (start_ts, end_ts),
+        }
+    """
     if not path.exists():
         raise FileNotFoundError(
-            f"Missing splits_years.json at {path}. "
-            f"Run datadownload.py (make_splits) and data_processing.py."
+            f"Missing splits_dates.json at {path}. "
+            f"Run data_preprocessing.py to copy it into output."
         )
     with open(path, "r") as f:
         d = json.load(f)
-    splits = {k: [int(y) for y in v] for k, v in d.items()}
-    logger.info("Loaded splits_years.json: %s", splits)
-    return splits
+
+    out: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]] = {}
+    for split, val in d.items():
+        if not isinstance(val, (list, tuple)) or len(val) != 2:
+            raise ValueError(f"Expected [start, end] for split '{split}', got: {val}")
+        start_str, end_str = val
+        start_ts = pd.to_datetime(start_str).normalize()
+        end_ts   = pd.to_datetime(end_str).normalize()
+        out[split] = (start_ts, end_ts)
+
+    logger.info("Loaded splits_dates.json: %s", out)
+    return out
 
 
 # ------------------ sliding window builder ------------------ #
 
-def _build_facility_windows(
-    fac_id: str,
-    s_fac: pd.Series,
+def _build_plant_windows(
+    plant_id: str,
+    s_plant: pd.Series,
     nat_series: pd.Series,
     context_length: int,
     forecast_horizon: int,
-    split_years: List[int]  # can also be None
+    split_range: Optional[Tuple[pd.Timestamp, pd.Timestamp]],
 ) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """
-    Build sliding windows for a single facility.
+    Build sliding windows for a single plant.
 
     Returns a list of (x, y_fac, y_sec, y_nat) numpy arrays with shapes:
         x:      (T, 1)
@@ -111,17 +128,14 @@ def _build_facility_windows(
         y_nat:  (H, 1)
     """
 
-    # Sort by year and extract arrays
-    s_fac = s_fac.sort_index()
-    years = s_fac.index.to_numpy()
-    values = s_fac.to_numpy(dtype=float)
-    n = len(years)
+    # Series is indexed by date (Timestamp)
+    s_plant = s_plant.sort_index()
+    dates = pd.to_datetime(s_plant.index).to_numpy()  # numpy datetime64
+    values = s_plant.to_numpy(dtype=float)
+    n = len(dates)
 
     if n < context_length + forecast_horizon:
         return []
-
-    # Downstream code may pass None (e.g. for train) to disable year filtering
-    split_years_set = set(int(y) for y in split_years) if split_years else None
 
     nat_series = nat_series.sort_index()
 
@@ -130,34 +144,37 @@ def _build_facility_windows(
     samples: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
 
     for start_idx in range(0, n - (T + H) + 1):
-        ctx_years   = years[start_idx : start_idx + T]
-        horizon_yrs = years[start_idx + T : start_idx + T + H]
+        ctx_dates    = dates[start_idx: start_idx + T]
+        horizon_dates = dates[start_idx + T: start_idx + T + H]
 
-        # Filter by horizon last year only if we HAVE a split_years_set
-        if split_years_set is not None and int(horizon_yrs[-1]) not in split_years_set:
-            continue
+        # Filter by horizon last date if we have a split_range
+        if split_range is not None:
+            last_h_date = pd.to_datetime(horizon_dates[-1]).normalize()
+            start_ts, end_ts = split_range
+            if not (start_ts <= last_h_date <= end_ts):
+                continue
 
-        # Facility context + target
-        x_fac = values[start_idx : start_idx + T].reshape(T, 1)
-        y_fac = values[start_idx + T : start_idx + T + H].reshape(H, 1)
+        # Plant context + target
+        x_plant = values[start_idx: start_idx + T].reshape(T, 1)
+        y_fac   = values[start_idx + T: start_idx + T + H].reshape(H, 1)
 
-        # National target aligned by year
-        y_nat_vals = nat_series.reindex(horizon_yrs).to_numpy(dtype=float)
+        # National target aligned by date
+        horizon_idx = pd.to_datetime(horizon_dates)
+        y_nat_vals = nat_series.reindex(horizon_idx).to_numpy(dtype=float)
         if np.any(np.isnan(y_nat_vals)):
+            # Skip if we don't have national data for this horizon
             continue
         y_nat = y_nat_vals.reshape(H, 1)
 
-        # ---- SCALE EVERYTHING DOWN TO A REASONABLE RANGE ----
-        # You can adjust this depending on your data magnitudes.
-        scale = 1e6  # try 1e6; if your values are smaller, you can use 1e5 or 1e4
-        x_fac = x_fac / scale
-        y_fac = y_fac / scale
-        y_nat = y_nat / scale
+        # ---- SCALE INPUTS TO A REASONABLE RANGE ----
+        # Adjust if needed based on your magnitudes.
+        scale_x = 1e4
+        x_plant = x_plant / scale_x
 
         # Sector target: fallback = national for now
         y_sec = y_nat.copy()
 
-        samples.append((x_fac, y_fac, y_sec, y_nat))
+        samples.append((x_plant, y_fac, y_sec, y_nat))
 
     return samples
 
@@ -183,42 +200,41 @@ class HierarchicalWindowedDataset(Dataset):
         context_length: int,
         forecast_horizon: int,
         root_dir: Path = OUTPUT_DIR,
-        min_facility_length: int = 8,
+        min_plant_length: int = 1,
     ):
         assert split in ("train", "val", "test"), f"Invalid split: {split}"
 
-        facility_series, _sector_series, nat_series = load_series_dicts(root_dir)
-        splits = load_splits(root_dir / "splits_years.json")
+        plant_series, _sector_series, nat_series = load_series_dicts(root_dir)
+        splits = load_splits(root_dir / "splits_dates.json")
 
-        if split == "train":
-            split_years = None      # do NOT filter train windows by year
-        else:
-            split_years = splits.get(split, [])
+        split_range = splits.get(split)
+        if split_range is None:
+            raise KeyError(f"Split '{split}' not found in splits_dates.json")
 
-        min_len = min(len(s) for s in facility_series.values())
-        max_len = max(len(s) for s in facility_series.values())
-        print(f"[{split}] facility series lengths: min={min_len}, max={max_len}")
+        min_len = min(len(s) for s in plant_series.values())
+        max_len = max(len(s) for s in plant_series.values())
+        print(f"[{split}] plant series lengths: min={min_len}, max={max_len}")
         print(f"[{split}] required length per sample: T+H = {context_length + forecast_horizon}")
 
-        self.samples = []
-        for fac_id, s_fac in facility_series.items():
-            if len(s_fac) < min_facility_length:
+        self.samples: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        for plant_id, s_plant in plant_series.items():
+            if len(s_plant) < min_plant_length:
                 continue
 
-            win = _build_facility_windows(
-                fac_id=str(fac_id),
-                s_fac=s_fac,
+            win = _build_plant_windows(
+                plant_id=str(plant_id),
+                s_plant=s_plant,
                 nat_series=nat_series,
                 context_length=context_length,
                 forecast_horizon=forecast_horizon,
-                split_years=split_years,
+                split_range=split_range,
             )
             self.samples.extend(win)
 
         if not self.samples:
             logger.warning(
                 "No samples built for split '%s'. Check context_length, "
-                "forecast_horizon, and splits_years.json.", split
+                "forecast_horizon, splits_dates.json, and data coverage.", split
             )
         else:
             logger.info("Built %d samples for split '%s'.", len(self.samples), split)
@@ -271,6 +287,7 @@ def create_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         drop_last=False,
+        persistent_workers=True if num_workers > 0 else False,
     )
     val_loader = DataLoader(
         val_ds,
@@ -278,6 +295,7 @@ def create_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         drop_last=False,
+        persistent_workers=True if num_workers > 0 else False,
     )
     test_loader = DataLoader(
         test_ds,
@@ -285,6 +303,7 @@ def create_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         drop_last=False,
+        persistent_workers=True if num_workers > 0 else False,
     )
 
     return train_loader, val_loader, test_loader

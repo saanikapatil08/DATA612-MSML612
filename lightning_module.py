@@ -202,6 +202,28 @@ class MSTLightningModule(pl.LightningModule):
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         return self._shared_step(batch, stage="test")
+    
+    def predict_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ):
+        """
+        Returns predictions in ORIGINAL space (co2e_total).
+
+        Useful for pl.Trainer.predict() and for downstream plotting.
+        """
+        x = batch["x"]
+        y_fac_pred, y_sec_pred, y_nat_pred = self(x)
+
+        return {
+            "y_fac_pred": y_fac_pred,
+            "y_sec_pred": y_sec_pred,
+            "y_nat_pred": y_nat_pred,
+        }
+
+
 
     # ----------------- optimizers ----------------- #
     def configure_optimizers(self):
