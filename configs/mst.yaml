@@ -1,0 +1,30 @@
+data:
+  context_length: 8
+  forecast_horizon: 3
+  batch_size: 64
+  num_workers: 2
+
+model:
+  d_model: 256
+  nhead: 8
+  num_encoder_layers: 4
+  num_decoder_layers: 3
+  dim_feedforward: 1024
+  dropout: 0.1
+  downsample_factor: 3
+  forecast_horizon: 3
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  step_lr_gamma: 0.98
+  step_lr_step_size: 10
+
+loss:
+  w_fac: 1.0
+  w_sec: 0.5
+  w_nat: 0.5
+  w_cons: 0.3
+
+trainer:
+  max_epochs: 50
+  log_every_n_steps: 20
+  gradient_clip_val: 1.0
