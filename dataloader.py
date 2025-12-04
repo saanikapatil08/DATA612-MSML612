@@ -149,10 +149,11 @@ def _build_facility_windows(
 
         # ---- SCALE EVERYTHING DOWN TO A REASONABLE RANGE ----
         # You can adjust this depending on your data magnitudes.
-        scale = 1e6  # try 1e6; if your values are smaller, you can use 1e5 or 1e4
-        x_fac = x_fac / scale
-        y_fac = y_fac / scale
-        y_nat = y_nat / scale
+        # but y_fac / y_nat / y_sec are left in original units so we can
+        # apply log1p in the LightningModule.
+        scale_x = 1e4  # adjust if needed
+        x_fac = x_fac / scale_x
+        # y_fac, y_nat, y_sec remain unscaled
 
         # Sector target: fallback = national for now
         y_sec = y_nat.copy()
@@ -271,6 +272,7 @@ def create_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         drop_last=False,
+        persistent_workers=True if num_workers > 0 else False,
     )
     val_loader = DataLoader(
         val_ds,
@@ -278,6 +280,7 @@ def create_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         drop_last=False,
+        persistent_workers=True if num_workers > 0 else False,
     )
     test_loader = DataLoader(
         test_ds,
@@ -285,6 +288,7 @@ def create_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         drop_last=False,
+        persistent_workers=True if num_workers > 0 else False,
     )
 
     return train_loader, val_loader, test_loader

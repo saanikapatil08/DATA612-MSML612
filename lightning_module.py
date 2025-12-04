@@ -116,17 +116,17 @@ class MSTLightningModule(pl.LightningModule):
         y_sec = batch["y_sec"]
         y_nat = batch["y_nat"]
 
-        # --------- sanity checks on inputs ----------
+        # --------- sanity checks on inputs ---------- #
         for name, t in [("x", x), ("y_fac", y_fac), ("y_sec", y_sec), ("y_nat", y_nat)]:
             if not torch.isfinite(t).all():
                 print(f"[{stage}] Non-finite values detected in {name}")
                 print(f"{name} min={t.min().item()}, max={t.max().item()}")
                 raise RuntimeError(f"Non-finite values in {name}")
 
-        # Forward pass
+        # --------- Forward pass (linear space) ---------- #
         y_fac_pred, y_sec_pred, y_nat_pred = self(x)
 
-        # --------- sanity checks on predictions ----------
+        # --------- sanity checks on predictions ---------- #
         for name, t in [("y_fac_pred", y_fac_pred),
                         ("y_sec_pred", y_sec_pred),
                         ("y_nat_pred", y_nat_pred)]:
@@ -135,15 +135,15 @@ class MSTLightningModule(pl.LightningModule):
                 print(f"{name} min={t.min().item()}, max={t.max().item()}")
                 raise RuntimeError(f"Non-finite values in {name}")
 
-        # Per-head MSE losses
+        # --------- losses in ORIGINAL space ---------- #
         L_fac = mse_loss(y_fac_pred, y_fac)
         L_sec = mse_loss(y_sec_pred, y_sec)
         L_nat = mse_loss(y_nat_pred, y_nat)
 
-        # Hierarchical consistency
+        # Hierarchical consistency in ORIGINAL space
         L_cons = consistency_loss(y_fac_pred, y_sec_pred, y_nat_pred)
 
-        # Total weighted loss
+        # Weighted total loss
         loss = (
             self.hparams.w_fac * L_fac
             + self.hparams.w_sec * L_sec
@@ -153,10 +153,13 @@ class MSTLightningModule(pl.LightningModule):
 
         if not torch.isfinite(loss):
             print(f"[{stage}] Loss became non-finite.")
-            print(f"  L_fac={L_fac.item()}, L_sec={L_sec.item()}, L_nat={L_nat.item()}, L_cons={L_cons.item()}")
+            print(
+                f"  L_fac={L_fac.item()}, L_sec={L_sec.item()}, "
+                f"L_nat={L_nat.item()}, L_cons={L_cons.item()}"
+            )
             raise RuntimeError("Non-finite loss encountered")
 
-        # Metrics for logging
+        # --------- metrics for logging (also in original space) ---------- #
         mets = compute_all_metrics(
             y_fac_pred=y_fac_pred,
             y_sec_pred=y_sec_pred,
@@ -193,6 +196,7 @@ class MSTLightningModule(pl.LightningModule):
 
         return loss
 
+
     # ----------------- training / validation / test ----------------- #
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         return self._shared_step(batch, stage="train")
@@ -202,6 +206,30 @@ class MSTLightningModule(pl.LightningModule):
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         return self._shared_step(batch, stage="test")
+    
+    def predict_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ):
+        """
+        Returns predictions in ORIGINAL space (co2e_total).
+
+        Useful for pl.Trainer.predict() and for downstream plotting.
+        """
+        x = batch["x"]
+        y_fac_pred_log, y_sec_pred_log, y_nat_pred_log = self(x)
+
+        y_fac_pred = torch.expm1(y_fac_pred_log).clamp_min(0.0)
+        y_sec_pred = torch.expm1(y_sec_pred_log).clamp_min(0.0)
+        y_nat_pred = torch.expm1(y_nat_pred_log).clamp_min(0.0)
+
+        return {
+            "y_fac_pred": y_fac_pred,
+            "y_sec_pred": y_sec_pred,
+            "y_nat_pred": y_nat_pred,
+        }
 
     # ----------------- optimizers ----------------- #
     def configure_optimizers(self):

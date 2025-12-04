@@ -76,7 +76,7 @@ def main():
 
     early_stop_cb = EarlyStopping(
         monitor="val_loss",
-        patience=10,
+        patience=7,   # was 10
         mode="min",
         verbose=True,
     )

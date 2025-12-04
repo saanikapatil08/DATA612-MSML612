@@ -1,30 +1,30 @@
 data:
-  context_length: 8
-  forecast_horizon: 3
-  batch_size: 64
+  context_length: 6          # shorter context (was 10–12)
+  forecast_horizon: 1        # next-year only
+  batch_size: 256            # bigger batch to exploit cross-fac pooling
   num_workers: 2
 
 model:
-  d_model: 256
-  nhead: 8
-  num_encoder_layers: 4
-  num_decoder_layers: 3
-  dim_feedforward: 1024
-  dropout: 0.1
-  downsample_factor: 3
-  forecast_horizon: 3
-  learning_rate: 0.0001
-  weight_decay: 0.01
-  step_lr_gamma: 0.98
+  d_model: 128
+  nhead: 4
+  num_encoder_layers: 2
+  num_decoder_layers: 2
+  dim_feedforward: 256
+  dropout: 0.2
+  downsample_factor: 2
+
+  learning_rate: 0.0003     # 3e-4
+  weight_decay: 0.01         # 1e-2
+  step_lr_gamma: 0.8
   step_lr_step_size: 10
 
 loss:
   w_fac: 1.0
-  w_sec: 0.5
-  w_nat: 0.5
-  w_cons: 0.3
+  w_sec: 0.2
+  w_nat: 0.0
+  w_cons: 0.0
 
 trainer:
-  max_epochs: 50
-  log_every_n_steps: 20
+  max_epochs: 60
   gradient_clip_val: 1.0
+  log_every_n_steps: 20
